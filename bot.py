@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import datetime
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Any
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, types
@@ -65,8 +65,7 @@ async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(CREATE_TABLE_SQL)
 
-        # Мягкая миграция: если бот раньше работал без username-колонки
-        # (в новых базах она уже есть)
+        # мягкая миграция для старых баз
         try:
             await db.execute("ALTER TABLE appointments ADD COLUMN username TEXT;")
         except Exception:
@@ -204,11 +203,9 @@ def normalize_username(text: str) -> str:
     t = (text or "").strip()
     if not t:
         return ""
-    # разрешаем ввод без @
     if t.startswith("@"):
         return t
     if " " in t:
-        # если человек написал имя/фамилию — оставим как есть
         return t
     return "@" + t
 
@@ -310,9 +307,7 @@ def cancel_list_kb(appointments: List[Tuple[int, str, str, str, Optional[str]]])
                 callback_data=f"cancel:{app_id}",
             )
         ])
-    rows.append([
-        InlineKeyboardButton(text="🏠 Меню", callback_data="menu:home"),
-    ])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="menu:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # ================= СЛОТЫ =================
@@ -326,18 +321,14 @@ DEFAULT_TIMES = [
 # ================= ОБЩЕЕ: ПОКАЗ МЕНЮ =================
 
 async def show_home(message_or_call: Any):
-    text = (
-        "💅 *Маникюр — запись*\n\n"
-        "Выбери действие:"
-    )
+    text = "💅 *Маникюр — запись*\n\nВыбери действие:"
     if isinstance(message_or_call, types.Message):
         await message_or_call.answer(text, reply_markup=main_menu_kb(), parse_mode="Markdown")
     else:
-        # CallbackQuery
         await message_or_call.message.edit_text(text, reply_markup=main_menu_kb(), parse_mode="Markdown")
         await message_or_call.answer()
 
-# ================= START (команда оставлена, но UI главный) =================
+# ================= START =================
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -362,10 +353,7 @@ async def cb_menu_book(call: types.CallbackQuery, state: FSMContext):
 async def cb_menu_my(call: types.CallbackQuery):
     apps = await list_user_appointments(call.from_user.id, only_future=True)
     if not apps:
-        await call.message.edit_text(
-            "У тебя нет будущих записей 🙂",
-            reply_markup=main_menu_kb(),
-        )
+        await call.message.edit_text("У тебя нет будущих записей 🙂", reply_markup=main_menu_kb())
         await call.answer()
         return
 
@@ -423,14 +411,16 @@ async def cb_day(call: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("t:"))
 async def cb_time(call: types.CallbackQuery, state: FSMContext):
-    _, date_iso, time_str = call.data.split(":")
+    # FIX: время содержит ":", поэтому split ограничиваем до 3 частей
+    # "t:YYYY-MM-DD:HH:MM" -> ["t", "YYYY-MM-DD", "HH:MM"]
+    _, date_iso, time_str = call.data.split(":", 2)
+
     if not await is_slot_free(date_iso, time_str):
         await call.answer("Этот слот уже занят, выбери другое время.", show_alert=True)
         return
 
     await state.update_data(time_str=time_str)
 
-    # Просим телефон
     await call.message.answer(
         f"Отлично! {human_date(date_iso)} в {time_str}.\n\n"
         f"Теперь отправь *телефон* (кнопкой контакта) 👇",
@@ -451,7 +441,6 @@ async def on_phone(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    # Берём телефон из контакта или текстом
     phone: Optional[str] = None
     if message.contact and message.contact.phone_number:
         phone = message.contact.phone_number
@@ -466,8 +455,7 @@ async def on_phone(message: types.Message, state: FSMContext):
 
     await state.update_data(phone=phone)
 
-    # Просим username
-    tg_username = message.from_user.username  # может быть None
+    tg_username = message.from_user.username
     if tg_username:
         uname = "@" + tg_username
         await state.update_data(username=uname)
@@ -518,10 +506,7 @@ async def finalize_booking(user: types.User, state: FSMContext, msg_obj: Any, vi
     username = data.get("username") or "-"
 
     if not date_iso or not time_str or not phone:
-        if via_callback:
-            await msg_obj.answer("Кажется, запись сбилась. Нажми /start и попробуй снова.")
-        else:
-            await msg_obj.answer("Кажется, запись сбилась. Нажми /start и попробуй снова.")
+        await msg_obj.answer("Кажется, запись сбилась. Нажми /start и попробуй снова.")
         await state.clear()
         return
 
@@ -534,14 +519,10 @@ async def finalize_booking(user: types.User, state: FSMContext, msg_obj: Any, vi
     )
 
     if not ok:
-        if via_callback:
-            await msg_obj.answer("Упс — этот слот только что заняли 😔\nВернись в меню и выбери другое время.")
-        else:
-            await msg_obj.answer("Упс — этот слот только что заняли 😔\nНажми /start и выбери другое время.")
+        await msg_obj.answer("Упс — этот слот только что заняли 😔\nВернись в меню и выбери другое время.")
         await state.clear()
         return
 
-    # уведомление мастеру
     await bot.send_message(
         MASTER_CHAT_ID,
         "📌 Новая запись!\n"
@@ -552,7 +533,6 @@ async def finalize_booking(user: types.User, state: FSMContext, msg_obj: Any, vi
         f"User ID: {user.id}",
     )
 
-    # убираем клавиатуру контакта
     await bot.send_message(
         user.id,
         "✅ Запись создана!\n"
@@ -564,7 +544,6 @@ async def finalize_booking(user: types.User, state: FSMContext, msg_obj: Any, vi
         reply_markup=types.ReplyKeyboardRemove(),
     )
 
-    # показать меню
     await bot.send_message(user.id, "Выбери действие:", reply_markup=main_menu_kb())
 
     await state.clear()
@@ -573,7 +552,6 @@ async def finalize_booking(user: types.User, state: FSMContext, msg_obj: Any, vi
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("cancel:"))
 async def cb_cancel(call: types.CallbackQuery):
-    # cancel:<id>
     raw = call.data.split(":", 1)[1]
     try:
         app_id = int(raw)
@@ -589,7 +567,6 @@ async def cb_cancel(call: types.CallbackQuery):
     _, date_iso, time_str, phone, username = deleted
     username = username or "-"
 
-    # уведомление мастеру — теперь с датой/временем
     await bot.send_message(
         MASTER_CHAT_ID,
         "❌ Отмена записи!\n"
@@ -601,7 +578,6 @@ async def cb_cancel(call: types.CallbackQuery):
         f"ID записи: {app_id}",
     )
 
-    # обновим список отмены
     apps = await list_user_appointments(call.from_user.id, only_future=True)
     if not apps:
         await call.message.edit_text("Запись отменена ✅\nБольше будущих записей нет.", reply_markup=main_menu_kb())
@@ -631,11 +607,10 @@ async def cb_back_days(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(BookingStates.choosing_date)
     await call.answer()
 
-# ================= (Опционально) Команды оставлены как запасной вариант =================
+# ================= (Опционально) Команды как запасной вариант =================
 
 @dp.message(Command("my"))
 async def cmd_my(message: types.Message):
-    # если кто-то всё же введёт /my
     apps = await list_user_appointments(message.from_user.id, only_future=True)
     if not apps:
         await message.answer("У тебя нет будущих записей 🙂", reply_markup=main_menu_kb())
@@ -648,7 +623,6 @@ async def cmd_my(message: types.Message):
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: types.Message):
-    # запасной вариант /cancel
     apps = await list_user_appointments(message.from_user.id, only_future=True)
     if not apps:
         await message.answer("Нечего отменять — будущих записей нет 🙂", reply_markup=main_menu_kb())
